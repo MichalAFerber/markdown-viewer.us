@@ -805,7 +805,8 @@
   });
   var fvh = /[#&]fvh=([^&]*)/.exec(location.hash);
   if (fvh){
-    var fvhName = decodeURIComponent(fvh[1]);                 // stranger-controlled — textContent only
+    var fvhName = fvh[1];                                   // ⚠️ stranger-controlled — textContent only
+    try { fvhName = decodeURIComponent(fvhName); } catch (_) {}  // malformed %-escapes must not abort the receiver
     history.replaceState(null, "", location.pathname + location.search);  // always clear, opener or not
     if (window.opener){
       try { window.opener.postMessage({ type:"fv-ready" }, "*"); } catch(_){}
