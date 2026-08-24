@@ -1,3 +1,3 @@
 User-agent: *
 Allow: /
-Sitemap: https://markdown-viewer.us/sitemap.xml
+Sitemap: https://markdown-viewer.us/sitemap-index.xml
