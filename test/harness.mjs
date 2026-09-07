@@ -3,11 +3,18 @@
 // standards (§15). Exit 1 on any failure.
 import { chromium } from "playwright";
 import http from "node:http";
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, existsSync, statSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const ROOT = process.cwd();
 const PORT = Number(process.env.PORT) || 8099;
+
+// -- ?name= fixture: real markdown, so render() genuinely runs marked +
+// DOMPurify rather than the checks below passing over an empty document.
+const FIX = mkdtempSync(join(tmpdir(), "md-harness-"));
+const FIXTURE_MD = join(FIX, "sample.md");
+writeFileSync(FIXTURE_MD, "# Hello\n\nA *fixture* document with a [link](https://example.com).\n");
 
 const H = {};
 for (const line of readFileSync(join(ROOT, "_headers"), "utf8").split("\n")) {
@@ -82,7 +89,79 @@ check("icons in dark mode (moon shown, sun hidden)", await page.evaluate(() => {
 check("choice persists (mykk-bg)", await page.evaluate(() => { try { return localStorage.getItem("mykk-bg") === "#0d1117"; } catch (e) { return false; } }));
 await page.click("#themeToggle");
 check("toggle back to light", await page.evaluate(() => document.getElementById("bgPicker").value) === "#ffffff");
+// -- ?name=: loading a file reflects its name into the URL, Clear removes it
+await page.setInputFiles("#fileInput", FIXTURE_MD);
+await page.waitForFunction(() => document.body.classList.contains("viewing"), null, { timeout: 10000 });
+check("load: URL reflects ?name=sample.md", await page.evaluate(() =>
+  new URLSearchParams(location.search).get("name")) === "sample.md");
+await page.click("#btnClear");
+check("clear: ?name= removed from the URL", await page.evaluate(() =>
+  new URLSearchParams(location.search).get("name")) === null);
+
+// -- repo-specific: render() is also the paste/drop path, and those callers pass
+// title "". Pasted text has no file, so ?name= must be cleared, not left stale.
+// This is what distinguishes syncQueryName(title) from syncQueryName(file.name).
+await page.setInputFiles("#fileInput", FIXTURE_MD);
+await page.waitForFunction(() => new URLSearchParams(location.search).get("name") === "sample.md", null, { timeout: 10000 });
+await page.evaluate(() => {
+  const dt = new DataTransfer();
+  dt.setData("text", "# pasted, not a file");
+  window.dispatchEvent(new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }));
+});
+check("paste after a file load clears ?name= (title is \"\")", await page.evaluate(() =>
+  new URLSearchParams(location.search).get("name") === null &&
+  document.body.classList.contains("viewing")));
+await page.click("#btnClear");
 await ctx.close();
+
+// -- direct visit with ?name=: empty-state names the last-viewed file
+const p3 = await browser.newContext().then((c) => c.newPage());
+hook(p3);
+await p3.goto(`http://localhost:${PORT}/?name=${encodeURIComponent("sample.md")}`, { waitUntil: "load", timeout: 30000 });
+check("?name=: 'shared for' sub-line names the file", await p3.evaluate(() => {
+  const sub = document.querySelector(".empty-sub");
+  return /shared for/.test(sub.textContent) && /sample\.md/.test(sub.textContent);
+}));
+await p3.context().close();
+
+// -- ?name= carrying markup renders as TEXT, never parsed as HTML.
+// This repo vendors DOMPurify, so the assertion also records that DOMPurify is
+// LOADED while this passes — the point being that it is irrelevant here.
+// render() sanitizes #content only; .empty-sub is not in its scope, so
+// textContent is the whole defense rather than a second layer behind one.
+// The innerHTML control fails with DOMPurify equally present, which is the
+// half of the proof that separates the two sinks.
+const p4 = await browser.newContext().then((c) => c.newPage());
+hook(p4);
+const HOSTILE_NAME = "<img src=x onerror=alert(1)>.md";
+await p4.goto(`http://localhost:${PORT}/?name=${encodeURIComponent(HOSTILE_NAME)}`, { waitUntil: "load", timeout: 30000 });
+check("?name=: hostile markup shows as literal text, never parsed", await p4.evaluate((name) => {
+  const sub = document.querySelector(".empty-sub");
+  return sub.textContent.includes(name)                 // present, verbatim
+    && sub.querySelector("img") === null                // no element was built
+    && sub.childNodes.length === 1                      // and the sub-line is
+    && sub.childNodes[0].nodeType === 3;                // exactly one text node
+}, HOSTILE_NAME));
+check("?name=: DOMPurify is loaded, and is not what protected the line above",
+  await p4.evaluate(() => typeof window.DOMPurify !== "undefined"));
+await p4.context().close();
+
+// -- ?name= with a quote payload: asserted for ENCODING FIDELITY, not for
+// attribute escaping. This sink is textContent and the name never lands in
+// attribute position, so a quote cannot open an attribute here no matter how
+// the value is handled — a test claiming otherwise passes unconditionally and
+// was removed rather than shipped (it passed against a raw innerHTML sink).
+// What this DOES catch is a naive escaper added upstream: any repo that starts
+// pre-escaping the name would show a literal &quot; here and fail.
+const QUOTE_NAME = 'a" b\' c & d.md';
+const p5 = await browser.newContext().then((c) => c.newPage());
+hook(p5);
+await p5.goto(`http://localhost:${PORT}/?name=${encodeURIComponent(QUOTE_NAME)}`, { waitUntil: "load", timeout: 30000 });
+check("?name=: quotes and ampersands survive verbatim as text", await p5.evaluate((name) => {
+  const sub = document.querySelector(".empty-sub");
+  return sub.textContent.includes(name);
+}, QUOTE_NAME));
+await p5.context().close();
 
 // -- fresh context with dark system scheme: must default dark
 const ctx2 = await browser.newContext({ colorScheme: "dark" });
