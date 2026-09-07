@@ -16,6 +16,30 @@ const FIX = mkdtempSync(join(tmpdir(), "md-harness-"));
 const FIXTURE_MD = join(FIX, "sample.md");
 writeFileSync(FIXTURE_MD, "# Hello\n\nA *fixture* document with a [link](https://example.com).\n");
 
+// -- Hostile document fixture for the DOMPurify pass in render().
+// Every payload is RAW HTML on purpose: `marked` passes raw HTML through
+// untouched, so what survives to the DOM is DOMPurify's doing and nothing
+// else. Markdown link syntax would have been the wrong vector — marked has
+// its own opinions about javascript: in [](), and a test it neutralizes
+// would pass with the sanitizer deleted.
+// Shares the tmpdir above rather than declaring a second `const FIX`, which
+// is what naively keeping both conflict sides would have produced.
+const HOSTILE_DOC = join(FIX, "hostile.md");
+writeFileSync(HOSTILE_DOC, [
+  "# Hostile fixture",
+  "",
+  "<script>window.__xssScript = true;</script>",
+  "",
+  '<img id="x-img" src="does-not-exist.png" onerror="window.__xssImg = true">',
+  "",
+  '<a id="x-a" href="javascript:void(window.__xssHref = true)">raw anchor</a>',
+  "",
+  '<iframe id="x-frame" src="about:blank"></iframe>',
+  "",
+  '<p onclick="window.__xssClick = true">handler on a paragraph</p>',
+  "",
+].join("\n"));
+
 const H = {};
 for (const line of readFileSync(join(ROOT, "_headers"), "utf8").split("\n")) {
   const m = line.match(/^[ \t]+([A-Za-z0-9-]+):[ \t]*(.+?)\s*$/);
@@ -170,6 +194,43 @@ hook(p2);
 await p2.goto(`http://localhost:${PORT}/`, { waitUntil: "load", timeout: 30000 });
 check("system-dark default (#0d1117)", await p2.evaluate(() => document.getElementById("bgPicker").value) === "#0d1117");
 await ctx2.close();
+
+// -- the document sink: marked -> DOMPurify -> #content.
+// Distinct from the ?name= sink, which lands in .empty-sub and is NOT covered
+// by DOMPurify (render() sanitizes #content only). This block is the one that
+// exercises the sanitizer, and every assertion below is written so that it
+// FAILS when DOMPurify is removed — see the note under "negative control".
+const ctxX = await browser.newContext();
+const px = await ctxX.newPage();
+hook(px);
+await px.goto(`http://localhost:${PORT}/`, { waitUntil: "load", timeout: 30000 });
+await px.setInputFiles("#fileInput", HOSTILE_DOC);
+await px.waitForFunction(() => document.body.classList.contains("viewing"), null, { timeout: 10000 });
+
+// Guard against a vacuous pass: if the document did not render at all, every
+// "hostile element is absent" assertion below would be trivially true.
+check("hostile doc actually rendered (h1 present)", await px.evaluate(() =>
+  !!document.getElementById("content").querySelector("h1")));
+
+check("sanitizer: <script> element does not survive into #content", await px.evaluate(() =>
+  document.getElementById("content").querySelector("script") === null));
+check("sanitizer: no onerror/onclick handler attribute survives", await px.evaluate(() => {
+  const c = document.getElementById("content");
+  return c.querySelector("[onerror]") === null && c.querySelector("[onclick]") === null;
+}));
+check("sanitizer: javascript: href does not survive", await px.evaluate(() => {
+  const a = document.getElementById("content").querySelector("#x-a");
+  return !a || !/^javascript:/i.test(a.getAttribute("href") || "");
+}));
+check("sanitizer: <iframe> does not survive", await px.evaluate(() =>
+  document.getElementById("content").querySelector("iframe") === null));
+// The img handler is a real execution vector, not a cosmetic one: innerHTML
+// does start the image load, so a surviving onerror runs. (A "<script> did not
+// execute" assertion would be vacuous here — innerHTML never runs scripts —
+// which is why the script check above asserts the ELEMENT is absent instead.)
+await px.waitForTimeout(300);
+check("sanitizer: img onerror did not fire", await px.evaluate(() => window.__xssImg !== true));
+await ctxX.close();
 
 // -- static assertions
 const sz = (p) => (existsSync(join(ROOT, p)) ? statSync(join(ROOT, p)).size : 0);
