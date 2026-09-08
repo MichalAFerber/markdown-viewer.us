@@ -156,7 +156,7 @@
   function hideHeader(){ if (body.classList.contains("viewing")) body.classList.add("header-hidden"); }
   function armIdleHide(){ clearTimeout(headerTimer); headerTimer = setTimeout(hideHeader, 3000); }
   function revealHeader(){ showHeader(); armIdleHide(); }
-  function showHeaderSoon(){ revealHeader(); }   // (compat) show now, then auto-hide after 3s
+  function _showHeaderSoon(){ revealHeader(); }   // (compat) show now, then auto-hide after 3s
   function onScroll(){
     ticking = false;
     if (!body.classList.contains("viewing")) return;
